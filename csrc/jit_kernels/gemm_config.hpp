@@ -103,7 +103,7 @@ struct GemmConfig {
     // Pipeline depths
     uint32_t num_l1_stages;        // L1 data buffer stages (MTE2 <-> MTE1)
     uint32_t num_l0_stages;        // L0 AB buffer stages (MTE1 <-> Cube)
-    uint32_t num_epilogue_stages;  // UB epilogue stages (AIC -> AIV)
+    uint32_t num_epilogue_stages;  // UB epilogue stages per AIV (AIC -> AIV)
     uint32_t num_l1_sf_stages;     // L1 SF buffer stages (0 for BF16)
     uint32_t sf_k_blocks;          // K-blocks per SF chunk (0 for BF16)
 

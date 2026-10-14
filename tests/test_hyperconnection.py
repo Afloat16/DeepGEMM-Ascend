@@ -83,16 +83,6 @@ def test_hc_prenorm_gemm(test_slice: str = 'default', skip_prof: bool = False) -
         diff_split = calc_diff(d_split[0], ref_d)
         assert diff_split < 1e-6, f'{m=}, {n=}, {k=}, {diff_split=:.10f}'
 
-        # Check deterministic
-        deep_gemm.use_deterministic_algorithms(True)
-        deep_gemm.tf32_hc_prenorm_gemm(a, b, d, sqr_sum)
-        deterministic_d, deterministic_sqr_sum = d.clone(), sqr_sum.clone()
-        for _ in range(10):
-            deep_gemm.tf32_hc_prenorm_gemm(a, b, d, sqr_sum)
-            assert torch.equal(d, deterministic_d)
-            assert torch.equal(sqr_sum, deterministic_sqr_sum)
-        deep_gemm.use_deterministic_algorithms(False)
-
         # Perf
         prof = None
         if not skip_prof:
@@ -105,6 +95,43 @@ def test_hc_prenorm_gemm(test_slice: str = 'default', skip_prof: bool = False) -
             count_bytes(a, b, d, sqr_sum),
             prof,
         )
+    print()
+
+
+def test_hc_prenorm_gemm_deterministic(test_slice: str = 'default') -> None:
+    disable_cpu_fallback()
+    deep_gemm.use_deterministic_algorithms(True)
+
+    print(f'Testing MHC prenorm gemm deterministic: {test_slice}')
+    for m, n, k in CASE_SLICES[test_slice]:
+        a = torch.randn((m, k), dtype=torch.bfloat16, device='npu')
+        b = torch.randn((n, k), dtype=torch.float32, device='npu')
+        d = torch.empty((m, n), dtype=torch.float32, device='npu')
+        sqr_sum = torch.empty((m,), dtype=torch.float32, device='npu')
+        deep_gemm.tf32_hc_prenorm_gemm(a, b, d, sqr_sum)
+
+        # Check correctness before repeatability and batch invariance.
+        ref_d = a.float() @ b.T
+        ref_sqr_sum = a.float().square().sum(-1)
+        diff_d = calc_diff(d, ref_d)
+        diff_sqr_sum = calc_diff(sqr_sum, ref_sqr_sum)
+        assert diff_d < 1e-6, f'deterministic: {m=}, {n=}, {k=}, {diff_d=:.10f}'
+        assert diff_sqr_sum < 1e-6, f'deterministic: {m=}, {n=}, {k=}, {diff_sqr_sum=:.10f}'
+        deterministic_d, deterministic_sqr_sum = d.clone(), sqr_sum.clone()
+        for _ in range(10):
+            deep_gemm.tf32_hc_prenorm_gemm(a, b, d, sqr_sum)
+            assert torch.equal(d.view(torch.int32), deterministic_d.view(torch.int32)), f'D repeat: {m=}, {n=}, {k=}'
+            assert torch.equal(sqr_sum.view(torch.int32), deterministic_sqr_sum.view(torch.int32)), f'square sum repeat: {m=}, {n=}, {k=}'
+
+        # Check sampled rows individually against the full batch.
+        single_d = torch.empty((1, n), dtype=torch.float32, device='npu')
+        single_sqr_sum = torch.empty((1,), dtype=torch.float32, device='npu')
+        for row_idx in sorted({0, m // 2, m - 1}):
+            deep_gemm.tf32_hc_prenorm_gemm(a[row_idx:row_idx + 1], b, single_d, single_sqr_sum)
+            assert torch.equal(single_d.view(torch.int32), deterministic_d[row_idx:row_idx + 1].view(torch.int32)), f'D BI: {m=}, {n=}, {k=}, {row_idx=}'
+            assert torch.equal(single_sqr_sum.view(torch.int32), deterministic_sqr_sum[row_idx:row_idx + 1].view(torch.int32)), f'square sum BI: {m=}, {n=}, {k=}, {row_idx=}'
+        print(f' > OK ({m=}, {n=}, {k=})', flush=True)
+    deep_gemm.use_deterministic_algorithms(False)
     print()
 
 
@@ -130,3 +157,4 @@ if __name__ == '__main__':
 
     for test_slice in selected_slices:
         test_hc_prenorm_gemm(test_slice, skip_prof=args.skip_prof)
+        test_hc_prenorm_gemm_deterministic(test_slice)

@@ -104,21 +104,20 @@ static PagedMQALogitsConfig select_paged_mqa_logits_config(uint32_t num_heads) {
 
 static void launch_paged_mqa_logits_metadata(
     const uint32_t& num_q_tokens,
-    const uint32_t& num_q_tokens_per_block, const uint32_t& split_kv,
+    const uint32_t& split_kv,
     const uint32_t& num_q_tokens_per_tile, const uint32_t& num_cores,
     void* context_lens, void* indices,
     void* metadata
 ) {
     const auto code = std::format(R"(
-#include <deep_gemm/scheduler/paged_mqa_logits_metadata.hpp>
+#include <deep_gemm/paged_mqa_logits_metadata.hpp>
 
 using namespace deep_gemm;
 static void __instantiate() {{
     auto p = reinterpret_cast<void*>(&paged_mqa_logits_metadata_simt_impl<
-        {}, {}, {}, {}>);
+        {}, {}, {}>);
 }}
 )",
-        num_q_tokens_per_block,
         split_kv,
         num_q_tokens_per_tile,
         num_cores);

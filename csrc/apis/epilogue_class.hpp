@@ -16,6 +16,8 @@ static void register_apis(pybind11::module_& m) {
         .def(pybind11::init<const float&>(), pybind11::arg("alpha"));
     pybind11::class_<FP8QuantizationEpilogue, EpilogueClass, std::shared_ptr<FP8QuantizationEpilogue>>(submodule, "FP8Quantization")
         .def(pybind11::init<const torch::Tensor&>(), pybind11::arg("sfd"));
+    pybind11::class_<BF16StochasticRoundingEpilogue, EpilogueClass, std::shared_ptr<BF16StochasticRoundingEpilogue>>(submodule, "BF16StochasticRounding")
+        .def(pybind11::init<>());
 }
 
 } // namespace deep_gemm::epilogue_class
