@@ -17,7 +17,7 @@ public:
 
     virtual std::string get_epilogue_operator_type() const = 0;
 
-    virtual EpilogueOperatorArgs make_epilogue_operator_args(const uint32_t& n) const { return {}; }
+    virtual epilogue::Args make_epilogue_operator_args(const uint32_t& n) const { return {}; }
 
     virtual std::optional<torch::Tensor> get_output_sf() const { return std::nullopt; }
 
@@ -43,8 +43,35 @@ public:
         return "epilogue::operators::ScaleByAlpha";
     }
 
-    EpilogueOperatorArgs make_epilogue_operator_args(const uint32_t& n) const override {
+    epilogue::Args make_epilogue_operator_args(const uint32_t& n) const override {
         return {.alpha = alpha};
+    }
+};
+
+class BiasEpilogue final : public EpilogueClass {
+    epilogue::Args args;
+
+public:
+    explicit BiasEpilogue(const torch::Tensor& bias) {
+        args.bias = reinterpret_cast<uintptr_t>(bias.data_ptr());
+    }
+
+    std::string get_epilogue_operator_type() const override {
+        return "epilogue::operators::AddBias";
+    }
+
+    epilogue::Args make_epilogue_operator_args(const uint32_t& n) const override { return args; }
+};
+
+class BF16StochasticRoundingEpilogue final : public EpilogueClass {
+public:
+    std::string get_epilogue_operator_type() const override {
+        return "epilogue::operators::StochasticRoundToBF16";
+    }
+
+    void check(const std::optional<torch::Tensor>& c, const torch::Tensor& d) const override {
+        DJ_HOST_ASSERT(not c.has_value() and d.scalar_type() == torch::kBFloat16,
+                       "Stochastic rounding requires a direct BF16 output");
     }
 };
 
@@ -58,7 +85,7 @@ public:
         return "epilogue::operators::QuantizeToFP8";
     }
 
-    EpilogueOperatorArgs make_epilogue_operator_args(const uint32_t& n) const override {
+    epilogue::Args make_epilogue_operator_args(const uint32_t& n) const override {
         return {.sfd = reinterpret_cast<uintptr_t>(sfd.data_ptr()),
                 .sfd_stride = static_cast<uint64_t>(sfd.stride(-1)), .shape_n = n};
     }
@@ -71,7 +98,7 @@ public:
         DJ_HOST_ASSERT(d.dim() == 2 or d.dim() == 3);
         const auto m = d.size(-2), n = d.size(-1);
         const auto num_batches = d.dim() == 3 ? d.size(0) : 1;
-        DJ_HOST_ASSERT(n % MX_SF_DIVISOR == 0);
+        DJ_HOST_ASSERT(n % (2 * MX_SF_DIVISOR) == 0, "FP8 output requires N to be a multiple of 128");
         DJ_HOST_ASSERT(d.stride(-1) == 1 and (d.dim() == 2 or d.stride(0) == n));
         DJ_HOST_ASSERT(sfd.scalar_type() == torch::kShort and sfd.dim() == 2 and sfd.device() == d.device());
         DJ_HOST_ASSERT(sfd.size(0) == m and sfd.size(1) == num_batches * n / MX_SF_DIVISOR);

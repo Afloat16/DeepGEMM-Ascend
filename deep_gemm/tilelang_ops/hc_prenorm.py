@@ -10,7 +10,7 @@ from tilelang.layout import make_ascend_compact_nz_layout
 from .. import _C
 
 
-def get_config(mhc_hidden_size: int, mhc_mult3: int, num_tokens: int) -> dict:
+def get_config(mhc_hidden_size: int, mhc_mult3: int, num_tokens: int, deterministic: bool = False) -> dict:
     """Return optimal kernel parameters for a given shape."""
     block_num_tokens = 128
     block_hidden = 256
@@ -30,14 +30,15 @@ def get_config(mhc_hidden_size: int, mhc_mult3: int, num_tokens: int) -> dict:
     num_l0b_stages = l0b_size_bytes // (block_mhc_mult3 * block_hidden * 4)
     num_l0c_stages = l0c_size_bytes // (block_num_tokens * block_mhc_mult3 * 4)
 
-    num_k_splits_by_tokens = max(1, num_aic_cores * num_l0c_stages // num_token_blocks)
+    # K partitioning defines the per-row floating-point reduction.
+    # M-dependent split selection improves L0C residency/B reuse,
+    # but changes the reduction grouping and breaks batch invariance.
+    num_k_splits_by_workload = (
+        16 if deterministic else max(1, num_aic_cores * num_l0c_stages // num_token_blocks)
+    )
     num_k_splits_by_hidden = num_hidden_blocks & -num_hidden_blocks
     num_k_splits_by_cores = num_aic_cores & -num_aic_cores
-    split_limit = min(
-        num_k_splits_by_tokens,
-        num_k_splits_by_hidden,
-        num_k_splits_by_cores,
-    )
+    split_limit = min(num_k_splits_by_workload, num_k_splits_by_hidden, num_k_splits_by_cores)
     num_k_splits = 1 << (split_limit.bit_length() - 1)
 
     active_aic_cores = num_k_splits * min(num_aic_cores // num_k_splits, num_token_blocks)
@@ -389,7 +390,7 @@ def tf32_hc_prenorm_gemm(a: torch.Tensor,
     if m == 0:
         return
     deterministic = _C.get_deterministic_algorithms()
-    config = get_config(k, n, m)
+    config = get_config(k, n, m, deterministic=deterministic)
     if _C.get_dry_run():
         # par_compile() sets the dry run flag: build the kernel but execute nothing.
         tf32_hc_prenorm_gemm_kernel.compile(a, b, out_mul, out_sqr_sum, deterministic=deterministic, **config)

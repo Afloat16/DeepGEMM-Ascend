@@ -209,11 +209,12 @@ def aligned(size: int, alignment: int):
     return (size + alignment - 1) // alignment * alignment
 
 
-def generate_psum_layout(expected_size: int, num_groups: int, alignment: int, device: str = 'npu'):
+def generate_psum_layout(expected_size: int, num_groups: int, alignment: int, device: str = 'npu', sizes: list[int] | None = None):
+    assert sizes is None or len(sizes) == num_groups
     psum_layout = []
     psum = 0
-    for _ in range(num_groups):
-        size = max(int(random.uniform(0.7, 1.3) * expected_size), 0)
+    for group_idx in range(num_groups):
+        size = sizes[group_idx] if sizes is not None else max(int(random.uniform(0.7, 1.3) * expected_size), 0)
         psum_layout.append(psum + size)
         psum = aligned(psum + size, alignment)
     return psum, psum_layout, torch.tensor(psum_layout, dtype=torch.int32, device=device)
@@ -262,6 +263,10 @@ class GemmTestDesc:
     recipe: tuple[int, int, int] = (1, 1, 32)
     alpha: float | None = None
     tag: str | None = None
+    with_bias: bool = False
+    ks_cpu: list[int] | None = None
+    host_ks_cpu: list[int] | None = None
+    profile: bool = True
 
     @property
     def m(self): return self.shape_mnk[0]
@@ -296,11 +301,11 @@ class GemmTestDesc:
         m, n, k = self.shape_mnk
 
         c = None
-        if self.accumulate:
+        if self.accumulate or self.with_bias:
             if device == 'meta':
-                c = torch.empty(m, n, dtype=self.cd_dtype, device=device)
+                c = torch.empty(1 if self.with_bias else m, n, dtype=self.cd_dtype, device=device)
             else:
-                c = torch.randn(m, n, dtype=self.cd_dtype, device='npu')
+                c = torch.randn(1 if self.with_bias else m, n, dtype=self.cd_dtype, device='npu')
 
         a, a_repr = generate_operand_with_major(
             (m, k), self.a_recipe, self.a_dtype,
@@ -314,7 +319,7 @@ class GemmTestDesc:
         else:
             alpha_value = self.alpha if self.alpha is not None else 1.0
             d = (alpha_value * (a_repr.float() @ b_repr.float().T)
-                 + (c if self.accumulate else 0)).to(self.cd_dtype)
+                 + (c if c is not None else 0)).to(self.cd_dtype)
 
         return (m, n, k), a, b, c, d, (None, None)
 
@@ -355,13 +360,14 @@ class GemmTestDesc:
 
     def _generate_k_grouped_contiguous(self, device: str):
         m, n, expected_k = self.shape_mnk
-        total_k, g_layout_cpu, g_layout = generate_psum_layout(expected_k, self.num_groups, self.alignment, device)
-        assert self.accumulate, "k-grouped layout requires accumulation"
+        total_k, g_layout_cpu, g_layout = generate_psum_layout(expected_k, self.num_groups, self.alignment, device, self.ks_cpu)
 
-        if device == 'meta':
-            c = torch.empty(self.num_groups, m, n, dtype=self.cd_dtype, device=device)
-        else:
-            c = torch.randn(self.num_groups, m, n, dtype=self.cd_dtype, device='npu')
+        c = None
+        if self.accumulate:
+            if device == 'meta':
+                c = torch.empty(self.num_groups, m, n, dtype=self.cd_dtype, device=device)
+            else:
+                c = torch.randn(self.num_groups, m, n, dtype=self.cd_dtype, device='npu')
 
         assert self.a_major == Major.MN, "a must be MN-major for k-grouped layout"
         assert self.b_major == Major.MN, "b must be MN-major for k-grouped layout"
@@ -387,7 +393,8 @@ class GemmTestDesc:
         else:
             d = torch.zeros(self.num_groups, m, n, dtype=self.cd_dtype, device='npu')
             for i, ks in enumerate(iter_psum_slice(g_layout_cpu, self.alignment)):
-                d[i, :, :] = c[i, :, :] + a_repr[ks, :].T @ b_repr[ks, :]
+                product = (a_repr[ks, :].float().T @ b_repr[ks, :].float()).to(self.cd_dtype)
+                d[i, :, :] = (c[i, :, :] if self.accumulate else 0) + product
 
         return (m, n, total_k), a, b, c, d, (g_layout, None)
 
@@ -596,6 +603,16 @@ def _enumerate_m_grouped_contiguous(
                 yield create_test(num_groups, expected_m, n, k, major_b)
 
 
+def enumerate_k_grouped_contiguous_test_variants(real_ks_cpu: list[int]):
+    yield list(real_ks_cpu)
+
+    empty_ks_cpu = [0 if random.random() < 0.25 else k for k in real_ks_cpu]
+    empty_ks_cpu[0], empty_ks_cpu[-1] = 0, real_ks_cpu[-1]
+    yield empty_ks_cpu
+
+    yield [k if group_idx == len(real_ks_cpu) // 2 else 0 for group_idx, k in enumerate(real_ks_cpu)]
+
+
 def _enumerate_k_grouped_contiguous(
         a_dtype: torch.dtype,
         b_dtype: torch.dtype
@@ -608,18 +625,28 @@ def _enumerate_k_grouped_contiguous(
         (16, 4096, 7168, 2048), (16, 7168, 2048, 2048),   # EP16
     ]
 
+    # CUDA's output modes plus the existing Ascend BF16 accumulation coverage.
+    cd_options = [(True, torch.float32), (False, torch.float32), (False, torch.bfloat16), (True, torch.bfloat16)]
+    alignment = 256
     for num_groups, m, n, expected_k in k_grouped_list:
-        yield GemmTestDesc(
-            GemmType.KGroupedContiguousWithPsumLayout,
-            a_dtype, b_dtype, torch.bfloat16,
-            (m, n, expected_k),
-            Major.MN, Major.MN,
-            accumulate=True,
-            num_groups=num_groups,
-            alignment=256,
-            recipe=(1, 1, 32),
-            tag=f'k-grouped, expected-k={expected_k:>4}'
-        )
+        real_ks_cpu = [max(1, int(expected_k * random.uniform(0.7, 1.3))) for _ in range(num_groups)]
+        for variant, ks_cpu in zip(('normal', 'empty', 'single'), enumerate_k_grouped_contiguous_test_variants(real_ks_cpu)):
+            host_ks_options = (('list', [aligned(k, alignment) for k in ks_cpu]), ('none', None), ('empty', []))
+            for (accumulate, cd_dtype), (hint, host_ks_cpu) in product(cd_options, host_ks_options):
+                yield GemmTestDesc(
+                    GemmType.KGroupedContiguousWithPsumLayout,
+                    a_dtype, b_dtype, cd_dtype,
+                    (m, n, expected_k),
+                    Major.MN, Major.MN,
+                    accumulate=accumulate,
+                    num_groups=num_groups,
+                    alignment=alignment,
+                    recipe=(1, 1, 32),
+                    tag=f'k-grouped, expected-k={expected_k:>4}, variant={variant}, ks-cpu={hint}',
+                    ks_cpu=ks_cpu,
+                    host_ks_cpu=host_ks_cpu,
+                    profile=variant == 'normal' and bool(host_ks_cpu),
+                )
 
 
 def enumerate_gemm_tests(

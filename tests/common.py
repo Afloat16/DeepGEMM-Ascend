@@ -4,11 +4,13 @@ import deep_gemm
 import random
 from dataclasses import replace
 from deep_gemm.testing.bench import bench_msprof
-from utils import assert_equal, count_bytes, print_perf
+from utils import assert_equal, assert_stochastic_bf16_matches_fp32, count_bytes, print_perf
+from utils import assert_direct_output_matches_fp32_accumulation
 from generators import major_opt, enumerate_gemm_tests, GemmType, Major, GemmTestDesc
 from deep_gemm.testing.disable_fallback import disable_cpu_fallback
 from deep_gemm.testing.par_compile import par_compile
 from functools import partial
+from itertools import product
 
 
 def get_tag_name(gemm_type: GemmType, unaligned_mn: bool, unaligned_k: bool, strided: bool):
@@ -45,10 +47,12 @@ def get_transposed(x: torch.Tensor, dim0: int, dim1: int):
 
 
 def gemm_dg(test: GemmTestDesc, a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, d: torch.Tensor,
-            g_layout: torch.Tensor | None = None, trans_ab: str = 'nt', alpha: float | None = None):
+            g_layout: torch.Tensor | None = None, trans_ab: str = 'nt', alpha: float | None = None, epilogue=None):
     gemm_name = 'fp8_fp4' if test.has_sf else 'bf16'
-    extra_args = {}
-    if test.accumulate:
+    extra_args = {'epilogue': epilogue}
+    if test.with_bias:
+        extra_args['c'] = c
+    elif test.accumulate:
         assert test.gemm_type == GemmType.Normal or test.gemm_type == GemmType.KGroupedContiguousWithPsumLayout
         d.copy_(c)
         extra_args['c'] = d
@@ -74,7 +78,8 @@ def gemm_dg(test: GemmTestDesc, a: torch.Tensor, b: torch.Tensor, c: torch.Tenso
             extra_args['recipe'] = test.recipe
         assert trans_ab == 'tn'
         k_grouped_gemm_name = 'fp8' if test.has_sf else gemm_name
-        getattr(deep_gemm, f'k_grouped_{k_grouped_gemm_name}_gemm_{trans_ab}_contiguous')(a, b, d, None, g_layout, **extra_args)
+        getattr(deep_gemm, f'k_grouped_{k_grouped_gemm_name}_gemm_{trans_ab}_contiguous')(
+            a, b, d, test.host_ks_cpu, g_layout, **extra_args)
     else:
         return False
 
@@ -136,6 +141,7 @@ def run_gemm_test(
 ):
     disable_cpu_fallback()
     alpha_rng = random.Random(0)
+    is_k_grouped = gemm_type == GemmType.KGroupedContiguousWithPsumLayout
 
     title = f'{get_tag_dtype(a_dtype)} x {get_tag_dtype(b_dtype)} gemm: {get_tag_name(gemm_type, unaligned_mn, unaligned_k, strided)}'
     print('Testing', title)
@@ -145,15 +151,27 @@ def run_gemm_test(
 
     kernels = []
     for test in tests:
-        # Compile from metadata without allocating NPU storage.
-        _, a, b, c, d_ref, (g_layout, _) = test.generate(device='meta')
-        for trans_ab in test.get_available_trans_ab():
-            kernels.append(partial(gemm_dg, test, a, b, c, d_ref, g_layout=g_layout, trans_ab=trans_ab))
-            if gemm_type == GemmType.Normal:
-                alpha = alpha_rng.uniform(-1.0, 1.0)
-                alpha_test = replace(test, alpha=alpha)
-                kernels.append(partial(gemm_dg, alpha_test, a, b, c, d_ref, g_layout=g_layout,
-                                       trans_ab=trans_ab, alpha=alpha))
+        for with_bias in (False, True) if gemm_type == GemmType.Normal else (False,):
+            compile_test = replace(test, with_bias=with_bias)
+            # Compile from metadata without allocating NPU storage.
+            _, a, b, c, d_ref, (g_layout, _) = compile_test.generate(device='meta')
+            for trans_ab in test.get_available_trans_ab():
+                kernels.append(partial(gemm_dg, compile_test, a, b, c, d_ref, g_layout=g_layout, trans_ab=trans_ab))
+                if gemm_type == GemmType.Normal and not with_bias:
+                    alpha = alpha_rng.uniform(-1.0, 1.0)
+                    alpha_test = replace(compile_test, alpha=alpha)
+                    kernels.append(partial(gemm_dg, alpha_test, a, b, c, d_ref, g_layout=g_layout,
+                                           trans_ab=trans_ab, alpha=alpha))
+                if is_k_grouped and not test.accumulate:
+                    fp32_test = replace(compile_test, accumulate=True, cd_dtype=torch.float32)
+                    fp32 = torch.empty_like(d_ref, dtype=torch.float32)
+                    kernels.append(partial(gemm_dg, fp32_test, a, b, fp32, fp32, g_layout=g_layout, trans_ab=trans_ab))
+                if a_dtype == b_dtype and not with_bias and not test.accumulate and test.cd_dtype == torch.bfloat16:
+                    kernels.append(partial(gemm_dg, compile_test, a, b, None, d_ref, g_layout=g_layout, trans_ab=trans_ab,
+                                           epilogue=deep_gemm.epilogue.BF16StochasticRounding()))
+                    if not is_k_grouped:
+                        kernels.append(partial(gemm_dg, compile_test, a, b, None, torch.empty_like(d_ref, dtype=torch.float32),
+                                               g_layout=g_layout, trans_ab=trans_ab))
     par_compile(kernels)
     del kernels, a, b, c, d_ref
     gc.collect()
@@ -165,14 +183,27 @@ def run_gemm_test(
         out_opt = 'bf16' if test.cd_dtype == torch.bfloat16 else 'fp32'
 
         for trans_ab in test.get_available_trans_ab():
-            for use_alpha in (False, True) if gemm_type == GemmType.Normal else (False,):
+            for use_alpha, with_bias in product((False, True), repeat=2) if gemm_type == GemmType.Normal else ((False, False),):
                 alpha = alpha_rng.uniform(-1.0, 1.0) if use_alpha else None
-                alpha_test = replace(test, alpha=alpha)
+                alpha_test = replace(test, alpha=alpha, with_bias=with_bias)
                 _, a, b, c, d_ref, (g_layout, cmp_spans) = alpha_test.generate()
-                d = torch.randn_like(d_ref)
+                d = torch.full_like(d_ref, float('nan')) if is_k_grouped and not test.accumulate else torch.randn_like(d_ref)
+                if use_alpha and with_bias:
+                    try:
+                        gemm_dg(alpha_test, a, b, c, d, g_layout=g_layout, trans_ab=trans_ab, alpha=alpha)
+                    except RuntimeError as e:
+                        assert 'alpha and bias cannot be used together' in str(e), str(e)
+                    else:
+                        raise AssertionError('alpha + bias must be rejected')
+                    continue
                 gemm_dg(alpha_test, a, b, c, d, g_layout=g_layout, trans_ab=trans_ab, alpha=alpha)
                 torch.npu.synchronize()
                 assert_equal(d, d_ref, f'dg: {alpha_test} {trans_ab}', cmp_spans, threshold=threshold)
+                if is_k_grouped and not test.accumulate:
+                    fp32_test = replace(test, accumulate=True, cd_dtype=torch.float32)
+                    assert_direct_output_matches_fp32_accumulation(
+                        d, lambda output, accumulator: gemm_dg(fp32_test, a, b, accumulator, output, g_layout, trans_ab),
+                        f'direct output: {test} {trans_ab}')
 
             (m, n, k), a, b, c, d_ref, (g_layout, cmp_spans) = test.generate()
             d = torch.randn_like(d_ref)
@@ -181,8 +212,18 @@ def run_gemm_test(
             if has_ref is not False:
                 assert_equal(d, d_ref, f'aclnn: {test} {trans_ab}', cmp_spans, threshold=threshold)
 
+            if a_dtype == b_dtype and not test.accumulate and test.cd_dtype == torch.bfloat16:
+                gemm_dg(test, a, b, None, d, g_layout=g_layout, trans_ab=trans_ab,
+                        epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+                fp32_test = replace(test, accumulate=True, cd_dtype=torch.float32) if is_k_grouped else test
+                assert_stochastic_bf16_matches_fp32(
+                    d, lambda output: gemm_dg(fp32_test, a, b, output.zero_() if fp32_test.accumulate else None, output, g_layout, trans_ab),
+                    f'stochastic rounding: {test} {trans_ab}')
+
+        if is_k_grouped:
+            k = sum(test.ks_cpu)
         prof = None
-        if not skip_prof:
+        if not skip_prof and test.profile and k:
             trans_ab = test.get_available_trans_ab()[0]
             prof = bench_msprof(lambda: gemm_dg(test, a, b, c, d, g_layout=g_layout, trans_ab=trans_ab), kernel_names='gemm_impl')
 
@@ -190,7 +231,7 @@ def run_gemm_test(
             m, n, k,
             f'layout={layout}, {out_opt}, acc={int(test.accumulate)}, {test.tag}',
             2.0 * m * n * k,
-            count_bytes(a, b, c),
+            count_bytes(a, b, c, d),
             prof
         )
     print()

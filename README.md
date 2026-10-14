@@ -55,6 +55,15 @@ Please refer to [DeepGEMM's interfaces](https://github.com/deepseek-ai/DeepGEMM#
 > [!NOTE]
 > The scaling factor format on Ascend differs from NVIDIA's: each pair of UE8M0 scaling factors along the K dimension is packed into an `int16`, and the packed values are stored in MN-major order for optimal hardware efficiency.
 
+Dense BF16, FP8, FP4 and mixed FP8×FP4 GEMMs accept `c` with shape `[M, N]` or `[1, N]`
+and the same dtype as `d`. Full C uses atomic add. A contiguous `[1, N]` bias is loaded
+and added in the AIV epilogue before the output cast.
+The `bf16_gemm_nn` and `fp8_fp4_gemm_nn` interfaces take `A[M, K]` and `B[K, N]`:
+
+```python
+deep_gemm.bf16_gemm_nn(a, b, c=bias, d=d)
+```
+
 ### Utilities
 
 The library provides some utility functions besides the above kernels:

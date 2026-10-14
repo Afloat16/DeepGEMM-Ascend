@@ -8,7 +8,6 @@ struct PagedMQARequestInfo {
     uint32_t q_token_start;
     uint32_t num_q_tokens;
     uint32_t context_len;
-    uint32_t block_table_row;
     uint32_t num_q_blocks;
 };
 
@@ -27,7 +26,6 @@ __aicore__ inline PagedMQARequestInfo make_paged_mqa_request(uint32_t q, uint32_
         .q_token_start=q,
         .num_q_tokens=count,
         .context_len=mqa_request_context_len(q, count, context_lens),
-        .block_table_row=q,
         .num_q_blocks=ceil_div(count, kNumQTokensPerBlock),
     };
 }
@@ -120,7 +118,7 @@ struct PagedMQALogitsScheduler {
     }
     __aicore__ uint32_t get_physical_page(uint32_t kv_token_base, uint32_t split_idx, uint32_t compact_page) const {
         const uint32_t logical_page_idx = get_kv_token_offset(kv_token_base, split_idx) / kPageSize + compact_page;
-        return block_table[static_cast<uint64_t>(request.block_table_row) * block_table_row_stride +
+        return block_table[static_cast<uint64_t>(request.q_token_start) * block_table_row_stride +
                            logical_page_idx];
     }
     // Adjacent logical pages start at the smaller physical page; AIV restores reversed pairs.

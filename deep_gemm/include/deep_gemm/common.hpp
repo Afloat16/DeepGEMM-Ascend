@@ -58,6 +58,7 @@ inline constexpr uint32_t L0CSizeBytes = 256 * 1024;  // L0C (fp32 accumulator)
 inline constexpr uint32_t UBSizeBytes = 256 * 1024;   // UB
 inline constexpr uint32_t kDCacheLineBytes = 64;
 inline constexpr uint32_t kL2SectorBytes = 128;
+inline constexpr uint32_t kNumPipeEvents = 8;
 
 inline constexpr uint32_t FRAC_MN = 16;      // NZ fractal M/N rows
 inline constexpr uint32_t MX_ADDR_DIV = 16;  // MX dst address encoding divisor
@@ -91,12 +92,15 @@ enum class GemmType : uint8_t {
 };
 
 // Runtime state shared by host classes and device operators.
-struct EpilogueOperatorArgs {
+namespace epilogue {
+struct Args {
     float alpha = 1.0f;
     uintptr_t sfd = 0;
     uint64_t sfd_stride = 0;
     uint32_t shape_n = 0;
+    uintptr_t bias = 0;
 };
+} // namespace epilogue
 
 __aicore__ constexpr bool is_m_grouped(GemmType t) {
     return t == GemmType::MGroupedContiguousWithPsumLayout;
