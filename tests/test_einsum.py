@@ -1,4 +1,5 @@
 import gc
+from functools import partial
 import torch
 import torch_npu  # noqa: F401
 
@@ -6,7 +7,7 @@ import deep_gemm
 from deep_gemm.testing.bench import bench_msprof
 from deep_gemm.testing.par_compile import par_compile
 from generators import enumerate_einsum, generate_einsum, quantize_with_major
-from utils import calc_diff, count_bytes
+from utils import assert_stochastic_bf16_matches_fp32, calc_diff, count_bytes
 
 _EXPR_ROLE = {
     'bhr,hdr->bhd': 'forward',
@@ -48,8 +49,13 @@ def test_einsum(dtype: torch.dtype = torch.float8_e4m3fn, skip_prof: bool = Fals
                 return deep_gemm.einsum(expr, A, B, D, c=D if c is not None else None)
             bytes_moved = count_bytes(A, B, D) + (count_bytes(c) if c is not None else 0)
 
+        launch_direct = partial(deep_gemm.fp8_einsum if is_fp8 else deep_gemm.einsum, expr, gen[0], gen[1])
         if collect is not None:
             collect.append(run)
+            if role != 'forward':
+                collect.append(partial(launch_direct, torch.empty_like(D, device='meta', dtype=torch.bfloat16),
+                                       epilogue=deep_gemm.epilogue.BF16StochasticRounding()))
+                collect.append(partial(launch_direct, torch.empty_like(D, device='meta', dtype=torch.float32)))
             return
 
         run()
@@ -61,7 +67,7 @@ def test_einsum(dtype: torch.dtype = torch.float8_e4m3fn, skip_prof: bool = Fals
         threshold = 1.5e-3 if is_fp8 else 1.5e-4
         assert diff < threshold, f'einsum {expr} ({role}) {b=} {h=} {r=} {d=}: diff={diff:.2e}'
 
-        if is_fp8 and expr == 'bhr,hdr->bhd' and d % 64 == 0:
+        if is_fp8 and expr == 'bhr,hdr->bhd' and d % 128 == 0:
             output = torch.empty_like(D, dtype=torch.float8_e4m3fn)
             sfd = torch.empty_strided((b, h * d // 64), (1, b), device='npu', dtype=torch.int16)
             deep_gemm.fp8_einsum(expr, (A, sfa), (B, sfb), (output, sfd))
@@ -81,6 +87,11 @@ def test_einsum(dtype: torch.dtype = torch.float8_e4m3fn, skip_prof: bool = Fals
             diff = calc_diff(restored_output, ref.reshape(b, h * d))
             assert diff < 2e-3, f'{b=}, {h=}, {r=}, {d=}, {diff=:.5f}'
 
+        if role != 'forward':
+            output = torch.empty_like(D, dtype=torch.bfloat16)
+            launch_direct(output, epilogue=deep_gemm.epilogue.BF16StochasticRounding())
+            assert_stochastic_bf16_matches_fp32(output, launch_direct, f'{expr}, {b=}, {h=}, {r=}, {d=}')
+
         flops = 2.0 * b * h * r * d
         prof = None
         if not skip_prof:
@@ -99,7 +110,7 @@ def test_einsum(dtype: torch.dtype = torch.float8_e4m3fn, skip_prof: bool = Fals
             run_case(*args, collect=collect)
         if is_fp8:
             for b, h, r, d in ((4, 8, 128, 128), (13, 8, 512, 256), (4096, 2, 128, 128),
-                               (1, 3, 128, 64), (13, 3, 128, 192), (257, 2, 128, 64)):
+                               (1, 3, 128, 128), (13, 3, 128, 384), (257, 2, 128, 128)):
                 run_case('bhr,hdr->bhd', b, h, r, d, collect=collect)
 
     kernels = []

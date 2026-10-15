@@ -93,7 +93,6 @@ static std::optional<GemmDesc> get_gemm_desc(
             std::tie(g, m, n, k) = get_shape_by_spec<"gmnk">("mk"_sp = a, "nk"_sp = b, "gmn"_sp = d, "g"_sp = grouped_layout.value());
             DJ_HOST_ASSERT(major_a == Major::MN);
             DJ_HOST_ASSERT(major_b == Major::MN);
-            DJ_HOST_ASSERT(c.has_value(), "K-grouped GEMM requires accumulation into C");
             break;
     }
 
@@ -103,9 +102,25 @@ static std::optional<GemmDesc> get_gemm_desc(
         DJ_HOST_ASSERT(grouped_layout->scalar_type() == torch::kInt);
     }
 
-    if (gemm_early_return(m, n, k, d, c, epilogue_class->get_output_sf())) {
+    // Meta and empty tensors have no data address; use storage identity for them.
+    const bool is_cd_same = c.has_value() && ((d.is_meta() || d.numel() == 0) ? c->is_alias_of(d) : c->data_ptr() == d.data_ptr());
+    const bool with_bias = gemm_type == GemmType::Normal && c.has_value() && !is_cd_same;
+    if (gemm_type == GemmType::Normal && c.has_value()) {
+        DJ_HOST_ASSERT(c->dim() == 2 && c->size(0) == (with_bias ? 1 : m) && c->size(1) == n,
+                       "C must match D's pointer and shape for accumulation, or be a separate [1, N] bias");
+        DJ_HOST_ASSERT(c->device() == d.device(), "C and D must be on the same device");
+    }
+    if (with_bias) {
+        DJ_HOST_ASSERT(c->is_contiguous(), "Bias must be contiguous");
+        DJ_HOST_ASSERT(dynamic_cast<const AlphaEpilogue*>(epilogue_class.get()) == nullptr,
+                       "alpha and bias cannot be used together");
+    }
+    if (gemm_early_return(m, n, k, d, c, epilogue_class->get_output_sf(), with_bias)) {
         return std::nullopt;
     }
+
+    if (with_bias)
+        epilogue_class = std::make_shared<BiasEpilogue>(c.value());
 
     std::optional<at::Tensor> sfa, sfb;
 
@@ -162,7 +177,7 @@ static std::optional<GemmDesc> get_gemm_desc(
         .cd_dtype = d.scalar_type(),
         .major_a = major_a,
         .major_b = major_b,
-        .acc = c.has_value(),
+        .acc = c.has_value() && !with_bias,
         .epilogue_class = std::move(epilogue_class),
         .compiled_dims = compiled_dims,
         .gemm_type = gemm_type,
@@ -199,14 +214,14 @@ static std::optional<GemmDesc> get_gemm_desc(
 //         * **NOTE**: when sfB is fp32, only 8-bit exponential is used, 23-bit mantissa must be 0, otherwise the kernel
 //         will panic
 //     d: shape [M, N], bf16 or fp32.
-//     c: if present, the kernel computes C += A @ B, otherwise computes D = A @ B
+//     c: optional tensor with D's dtype; alias D with the same shape for accumulation, or pass a separate contiguous [1, N] bias.
 //     recipe: optional combined quantization granularity (gran_m, gran_n, gran_k);
 //         mutually exclusive with recipe_a / recipe_b.
 //     recipe_a: optional per-operand granularity (gran_mn, gran_k) for A.
 //     recipe_b: optional per-operand granularity (gran_mn, gran_k) for B.
 //     compiled_dims: which dimensions (e.g. "mn" or "nk") are baked in as compile-time constants for the kernel.
 //     disable_ue8m0_cast: when true, forbid casting float32 scale factors into ue8m0.
-//     alpha: optional multiplier applied to A @ B before adding C.
+//     alpha: optional multiplier applied to A @ B before accumulation; cannot be combined with bias.
 template <bool kTransA, bool kTransB>
 static void fp8_fp4_gemm(
     const std::pair<torch::Tensor, torch::Tensor>& a_,
@@ -329,7 +344,7 @@ inline constexpr auto m_grouped_fp8_fp4_gemm_nn_contiguous = m_grouped_fp8_fp4_g
 //     d: shape [G, M, N], bf16 or fp32.
 //     ks_cpu: optional [G], int (on CPU). Per-group K sizes.
 //     grouped_layout: [G], int32. Per-group layout describing the contiguous K partition.
-//     c: if present, the kernel computes C += A @ B, otherwise computes D = A @ B
+//     c: optional [G, M, N] tensor with the same dtype as D; computes D = A @ B + C.
 //     recipe: combined quantization granularity (gran_m, gran_n, gran_k).
 //     compiled_dims: which dimensions are baked in as compile-time constants.
 //     use_psum_layout: must be true; selects the partial-sum output layout path.
@@ -403,9 +418,9 @@ static void k_grouped_fp8_gemm_nt_contiguous(
 //     a: [M, K] (nt/nn) or [K, M] (tn/tt), bf16
 //     b: [N, K] (nt/tt) or [K, N] (tn/nn), bf16
 //     d: [M, N], bf16 or fp32.
-//     c: if present, the kernel computes C += A @ B, otherwise computes D = A @ B
+//     c: optional tensor with D's dtype; alias D with the same shape for accumulation, or pass a separate contiguous [1, N] bias.
 //     compiled_dims: which dimensions (e.g. "mn" or "nk") are baked in as compile-time constants for the kernel.
-//     alpha: optional multiplier applied to A @ B before adding C.
+//     alpha: optional multiplier applied to A @ B before accumulation; cannot be combined with bias.
 template <bool kTransA, bool kTransB>
 static void bf16_gemm(
     const torch::Tensor& a_,
@@ -494,7 +509,7 @@ inline constexpr auto m_grouped_bf16_gemm_nn_contiguous = m_grouped_bf16_gemm_co
 //     d: [G, M, N], bf16 or fp32.
 //     ks_cpu: optional [G], int (on CPU). Per-group K sizes.
 //     grouped_layout: [G], int32. Per-group layout describing the contiguous K partition.
-//     c: if present, the kernel computes C += A @ B, otherwise computes D = A @ B
+//     c: optional [G, M, N] tensor with the same dtype as D; computes D = A @ B + C.
 //     compiled_dims: which dimensions are baked in as compile-time constants.
 //     use_psum_layout: must be true; selects the partial-sum output layout path.
 static void k_grouped_bf16_gemm_tn_contiguous(

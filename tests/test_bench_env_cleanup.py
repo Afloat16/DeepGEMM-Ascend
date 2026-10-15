@@ -1,12 +1,12 @@
 """Host-only tests for profiler environment cleanup."""
 
-from contextlib import ExitStack
 import importlib.util
 import os
-from pathlib import Path
 import sys
-from types import ModuleType, SimpleNamespace
 import unittest
+from contextlib import ExitStack
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 
@@ -85,7 +85,7 @@ class ProfilerEnvironmentTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop('ASCEND_WORK_PATH', None)
             self.run_failing_profile()
-            self.assertNotIn('ASCEND_WORK_PATH', os.environ)
+            self.assertIsNone(os.environ.get('ASCEND_WORK_PATH'))
 
 
 if __name__ == '__main__':

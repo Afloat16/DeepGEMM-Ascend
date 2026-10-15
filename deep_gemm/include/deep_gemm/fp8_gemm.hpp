@@ -29,7 +29,7 @@ template <
     GemmType kGemmType,
     typename ab_dtype_t,
     typename cd_dtype_t,
-    typename epilogue_operator_t,
+    template <typename> class epilogue_operator_t,
     uint32_t kAlignment,
     bool kDirectStore = false, bool kSingleMBlock = false
 >
@@ -41,13 +41,12 @@ __global__ __mix__(1, kDirectStore ? 0 : 2) void fp8_gemm_impl(
     gm_ptr<cd_dtype_t, Major::K> gm_d,
     uint32_t shape_m_runtime, uint32_t shape_n_runtime, uint32_t shape_k_runtime,
     __gm__ int32_t* grouped_layout, uint32_t num_groups,
-    epilogue_operator_t epilogue_operator
+    epilogue::Args epilogue_args
 ) {
     asc_init();
     static_assert(!kSingleMBlock || kGemmType == GemmType::Normal);
 
     if constexpr (kDirectStore) {
-        static_assert(std::is_same_v<epilogue_operator_t, epilogue::operators::Identity>);
         static_assert(!kWithAccumulation || std::is_same_v<cd_dtype_t, float>);
     }
 
@@ -73,8 +72,10 @@ __global__ __mix__(1, kDirectStore ? 0 : 2) void fp8_gemm_impl(
     constexpr uint32_t kNumCDStages = (BLOCK_M / MAD_M) * (BLOCK_N / MAD_N);
 
     const Epilogue<cd_dtype_t, epilogue_operator_t, kWithAccumulation,
-                   BLOCK_M, BLOCK_N, MAD_M, MAD_N, kNumEpilogueStages,
-                   kL2CtrlStoreCd> epilogue{epilogue_operator};
+                   BLOCK_M, BLOCK_N, MAD_M, MAD_N, kNumEpilogueStages, 2,
+                   kL2CtrlStoreCd> epilogue{epilogue_args};
+    static_assert(!kDirectStore || std::is_same_v<typename decltype(epilogue)::operator_t,
+                                                  epilogue::operators::Identity<typename decltype(epilogue)::params_t>>);
 
     constexpr l1_ptr<ab_dtype_t, kMajorA> l1a(BLOCK_M, BLOCK_K, 0);
     constexpr l1_ptr<ab_dtype_t, kMajorB> l1b(BLOCK_N, BLOCK_K, l1a.offset(kNumL1Stages));
@@ -239,7 +240,7 @@ __global__ __mix__(1, kDirectStore ? 0 : 2) void fp8_gemm_impl(
                                 epilogue.aic_store(l0c_tile, epi_stage_idx, mad_m, mad_n);
                             }
                         }
-                        epi_stage_idx = epi_stage_idx == kNumEpilogueStages - 1 ? 0 : epi_stage_idx + 1;
+                        epi_stage_idx = epi_stage_idx == epilogue.kNumStages - 1 ? 0 : epi_stage_idx + 1;
                     }
                 }
 
@@ -265,7 +266,8 @@ __global__ __mix__(1, kDirectStore ? 0 : 2) void fp8_gemm_impl(
         }
     } else {
         if constexpr (kDirectStore) return;
-        if (asc_get_sub_block_id() != kEpilogueAIVId) return;
+        if constexpr (is_k_grouped && !kWithAccumulation)
+            epilogue.template aiv_zero_empty_groups<kNumCores, kAlignment>(gm_d, shape_m, shape_n, grouped_layout, num_groups);
         epilogue.aiv_initialize();
 
         uint32_t s_epi = 0;

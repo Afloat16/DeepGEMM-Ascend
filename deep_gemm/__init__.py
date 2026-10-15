@@ -1,4 +1,4 @@
-__version__ = '0.1.0'
+__version__ = '0.1.1'
 
 import os
 import torch
@@ -73,10 +73,66 @@ from ._C import (
     fp8_fp4_mqa_logits,
     get_paged_mqa_logits_metadata,
     fp8_fp4_paged_mqa_logits,
+    get_sparse_mqa_logits_metadata,
+    fp8_fp4_sparse_mqa_logits,
     # Layout kernels
     transform_sf_into_required_layout,
     transform_k_grouped_sf_into_required_layout,
 )
+
+# Public sparse APIs live in deep_gemm: the non-paged functions are re-exported above.
+# Paged wrappers below own configuration and FIRST/REUSE state; their underscored _C
+# bindings are internal and bypass this state management.
+# The tensor owns mapping, KV split plan, physical blocks and compact KV; prepare scratch is temporary.
+def get_paged_sparse_mqa_logits_metadata(context_lens, block_table, indices, page_kv,
+                                         sparse_kv_block_indices, qk_dtype, sparse_block_kv):
+    """Prepare FIRST/REUSE state for MQA pages stored as [page DATA | page SF].
+
+    Use the public deep_gemm entry points for both prepare and logits so that
+    configuration and FIRST/REUSE state are managed together.
+
+    For each query, let B = sparse_block_kv, C = context_lens[q] >= 0 and
+    capacity = sparse_kv_block_indices.size(1). The first min(capacity, ceil(C / B))
+    logical block IDs must be unique, strictly increasing and satisfy 0 <= i * B < C.
+    The remaining entries are unused padding and may repeat.
+
+    Queries with the same request ID in indices must be consecutive. Their block-table
+    rows must agree on referenced logical pages. Every referenced logical page must
+    fit within its block-table row, and its physical page ID must index the KV cache
+    passed to the logits call.
+
+    The caller must guarantee these data constraints; no device-value validation is
+    performed. Violations can produce incorrect results or out-of-bounds accesses.
+    """
+    metadata = _C._get_paged_sparse_mqa_logits_metadata(
+        context_lens, block_table, indices, page_kv, sparse_kv_block_indices, qk_dtype, sparse_block_kv)
+    config = (sparse_kv_block_indices.shape[0], sparse_kv_block_indices.shape[1],
+              sparse_block_kv, page_kv, get_num_sms(), qk_dtype)
+    metadata._paged_sparse_mqa_state = (config, True)
+    return metadata
+
+
+def fp8_fp4_paged_sparse_mqa_logits(q, kv_cache, weights, metadata,
+                                    num_max_sparse_blocks, sparse_block_kv):
+    """Compute logits using the selected KV snapshot stored in metadata.
+
+    The first call caches KV; later calls reuse that snapshot with the current Q and
+    weights. Regenerate metadata after changing KV contents, even if indices are unchanged.
+    """
+    state = getattr(metadata, '_paged_sparse_mqa_state', None)
+    if state is None:
+        raise TypeError('metadata must come from get_paged_sparse_mqa_logits_metadata')
+    config, is_first = state
+    expected = (q[0].shape[0], num_max_sparse_blocks, sparse_block_kv,
+                kv_cache.shape[1], get_num_sms(), q[0].dtype)
+    if config != expected:
+        raise RuntimeError('metadata does not match the current paged sparse MQA configuration')
+    dry_run = _C.get_dry_run()
+    logits = _C._fp8_fp4_paged_sparse_mqa_logits(
+        q, kv_cache, weights, metadata, is_first, num_max_sparse_blocks, sparse_block_kv)
+    if is_first and not dry_run:
+        metadata._paged_sparse_mqa_state = (config, False)
+    return logits
 
 from .mega import (
     SymmBuffer,

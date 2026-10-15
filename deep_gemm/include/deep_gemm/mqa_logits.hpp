@@ -3,11 +3,9 @@
 #include <deep_gemm/ascend.hpp>
 #include <deep_gemm/scheduler/mqa_logits.hpp>
 #include <deep_gemm/scheduler/paged_mqa_logits.hpp>
-#include <c_api/asc_simd.h>
-
-using namespace __cce_simd;
 
 namespace deep_gemm {
+using namespace __cce_simd;
 
 // Pack adjacent scale pairs into the 16-token fragments consumed by L0B_MX.
 __simd_vf__ inline void vf_mqa_logits_pack_scales(__ubuf__ int16_t* scales, uint32_t num_elems) {
@@ -32,18 +30,8 @@ __simd_vf__ inline void vf_mqa_logits_pack_scales(__ubuf__ int16_t* scales, uint
     }
 }
 
-template <typename dtype_t>
-__host_aicore__ constexpr uint32_t get_num_elems_per_vec_reg() {
-    return asc_get_vf_len() / sizeof(dtype_t);
-}
-
 // Ascend 950 MTE3 requires a 32B-aligned UB source; GM address and length are unrestricted.
 constexpr uint32_t kLogitsAlignElems = 32 / sizeof(bfloat16_t);
-
-// Pad N to a complete reduction group.
-__aicore__ inline uint32_t mqa_logits_issued_n(uint32_t actual_n) {
-    return aligned(actual_n, get_num_elems_per_vec_reg<bfloat16_t>());
-}
 
 // Stage an unaligned row head through aligned UB scratch before MTE3.
 __simd_vf__ inline void vf_mqa_logits_stage_head(__ubuf__ bfloat16_t* dst, __ubuf__ bfloat16_t* src) {
@@ -87,7 +75,7 @@ __simd_callee__ inline void vf_mqa_logits_store_bf16(
     __ubuf__ bfloat16_t* dst, vector_bfloat16_t src,
     uint32_t reversed_pairs, uint32_t vec_idx
 ) {
-    constexpr uint32_t kNumElemsPerVecReg = get_num_elems_per_vec_reg<bfloat16_t>();
+    constexpr uint32_t kNumElemsPerVecReg = asc_get_vf_len() / sizeof(bfloat16_t);
     if constexpr (kPageSize == 128) {
         const uint32_t reversed = (reversed_pairs >> (vec_idx >> 1)) & 1u;
         dst += (vec_idx ^ reversed) * kNumElemsPerVecReg;
@@ -110,85 +98,55 @@ __simd_callee__ inline void vf_mqa_logits_store_bf16(
     asc_storealign(dst, src, asc_create_mask_b16(PAT_ALL));
 }
 
-template <uint32_t kPageSize, uint32_t kNumElems, uint32_t kNumHeads>
+template <uint32_t kPageSize, uint32_t kNumElems, uint32_t kNumHeads, uint32_t kSplitKV, uint32_t kNumQueries>
 __simd_vf__ inline void vf_mqa_logits_reduce(
     __ubuf__ bfloat16_t* score, __ubuf__ bfloat16_t* weights,
     __ubuf__ bfloat16_t* line,
     uint32_t q_local, uint32_t q_idx,
     uint32_t reversed_pairs
 ) {
-    constexpr uint32_t kNumElemsPerVecReg = get_num_elems_per_vec_reg<bfloat16_t>();
+    constexpr uint32_t kNumElemsPerVecReg = asc_get_vf_len() / sizeof(bfloat16_t);
     constexpr uint32_t kNumVecRegs = kNumElems / kNumElemsPerVecReg;
     static_assert(kNumElems % kNumElemsPerVecReg == 0 && kNumVecRegs >= 1 && kNumVecRegs <= 4);
+    static_assert((kNumQueries == 1 || kNumQueries == 2) && kSplitKV == 512);
     vector_bool mask = asc_create_mask_b16(PAT_ALL);
-    vector_bfloat16_t sum[kNumVecRegs];
-    #pragma unroll
-    for (uint32_t vec_idx = 0; vec_idx < kNumVecRegs; ++vec_idx)
-        asc_duplicate_scalar(sum[vec_idx], static_cast<bfloat16_t>(0), mask);
-
-    const uint32_t qh_base = q_local * kNumHeads;
-    auto weight_ptr = weights + q_idx * kNumHeads;
-    auto score_ptr = score + qh_base * kNumElems;
-    #pragma unroll 1
-    for (uint32_t h = 0; h < kNumHeads; ++h) {
-        vector_bfloat16_t w;
-        asc_loadalign_brc_postupdate(w, weight_ptr, 1);
-        #pragma unroll
-        for (uint32_t vec_idx = 0; vec_idx < kNumVecRegs; ++vec_idx) {
-            vector_bfloat16_t value;
-            asc_loadalign_postupdate(value, score_ptr, kNumElemsPerVecReg);
-            asc_mula(sum[vec_idx], value, w, mask);
-        }
-    }
-
-    #pragma unroll
-    for (uint32_t vec_idx = 0; vec_idx < kNumVecRegs; ++vec_idx)
-        vf_mqa_logits_store_bf16<kPageSize>(line, sum[vec_idx], reversed_pairs, vec_idx);
-}
-
-template <uint32_t kPageSize, uint32_t kNumElems, uint32_t kNumHeads, uint32_t kSplitKV>
-__simd_vf__ inline void vf_mqa_logits_reduce_2q(
-    __ubuf__ bfloat16_t* score, __ubuf__ bfloat16_t* weights,
-    __ubuf__ bfloat16_t* line,
-    uint32_t q_local, uint32_t q_idx,
-    uint32_t reversed_pairs
-) {
-    constexpr uint32_t kNumElemsPerVecReg = get_num_elems_per_vec_reg<bfloat16_t>();
-    constexpr uint32_t kNumVecRegs = kNumElems / kNumElemsPerVecReg;
-    static_assert(kNumElems % kNumElemsPerVecReg == 0 && kNumVecRegs >= 1 && kNumVecRegs <= 4 && kSplitKV == 512);
-    vector_bool mask = asc_create_mask_b16(PAT_ALL);
-    vector_bfloat16_t sum[kNumVecRegs][2];
+    vector_bfloat16_t sum[kNumVecRegs][kNumQueries];
     #pragma unroll
     for (uint32_t vec_idx = 0; vec_idx < kNumVecRegs; ++vec_idx) {
-        asc_duplicate_scalar(sum[vec_idx][0], static_cast<bfloat16_t>(0), mask);
-        asc_duplicate_scalar(sum[vec_idx][1], static_cast<bfloat16_t>(0), mask);
+        #pragma unroll
+        for (uint32_t query_idx = 0; query_idx < kNumQueries; ++query_idx)
+            asc_duplicate_scalar(sum[vec_idx][query_idx], static_cast<bfloat16_t>(0), mask);
     }
 
-    const uint32_t qh0 = q_local * kNumHeads;
-    const uint32_t qh1 = qh0 + kNumHeads;
-    auto weight_ptr_0 = weights + q_idx * kNumHeads;
-    auto weight_ptr_1 = weight_ptr_0 + kNumHeads;
-    auto score_ptr_0 = score + qh0 * kNumElems;
-    auto score_ptr_1 = score + qh1 * kNumElems;
+    __ubuf__ bfloat16_t* weight_ptr[kNumQueries];
+    __ubuf__ bfloat16_t* score_ptr[kNumQueries];
+    #pragma unroll
+    for (uint32_t query_idx = 0; query_idx < kNumQueries; ++query_idx) {
+        weight_ptr[query_idx] = weights + (q_idx + query_idx) * kNumHeads;
+        score_ptr[query_idx] = score + (q_local + query_idx) * kNumHeads * kNumElems;
+    }
     #pragma unroll 1
     for (uint32_t h = 0; h < kNumHeads; ++h) {
-        vector_bfloat16_t w0, w1;
-        asc_loadalign_brc_postupdate(w0, weight_ptr_0, 1);
-        asc_loadalign_brc_postupdate(w1, weight_ptr_1, 1);
+        vector_bfloat16_t weight[kNumQueries];
+        #pragma unroll
+        for (uint32_t query_idx = 0; query_idx < kNumQueries; ++query_idx)
+            asc_loadalign_brc_postupdate(weight[query_idx], weight_ptr[query_idx], 1);
         #pragma unroll
         for (uint32_t vec_idx = 0; vec_idx < kNumVecRegs; ++vec_idx) {
-            vector_bfloat16_t score_0, score_1;
-            asc_loadalign_postupdate(score_0, score_ptr_0, kNumElemsPerVecReg);
-            asc_mula(sum[vec_idx][0], score_0, w0, mask);
-            asc_loadalign_postupdate(score_1, score_ptr_1, kNumElemsPerVecReg);
-            asc_mula(sum[vec_idx][1], score_1, w1, mask);
+            #pragma unroll
+            for (uint32_t query_idx = 0; query_idx < kNumQueries; ++query_idx) {
+                vector_bfloat16_t value;
+                asc_loadalign_postupdate(value, score_ptr[query_idx], kNumElemsPerVecReg);
+                asc_mula(sum[vec_idx][query_idx], value, weight[query_idx], mask);
+            }
         }
     }
 
     #pragma unroll
     for (uint32_t vec_idx = 0; vec_idx < kNumVecRegs; ++vec_idx) {
-        vf_mqa_logits_store_bf16<kPageSize>(line, sum[vec_idx][0], reversed_pairs, vec_idx);
-        vf_mqa_logits_store_bf16<kPageSize>(line + kSplitKV, sum[vec_idx][1], reversed_pairs, vec_idx);
+        #pragma unroll
+        for (uint32_t query_idx = 0; query_idx < kNumQueries; ++query_idx)
+            vf_mqa_logits_store_bf16<kPageSize>(line + query_idx * kSplitKV, sum[vec_idx][query_idx], reversed_pairs, vec_idx);
     }
 }
 
@@ -200,21 +158,20 @@ __aicore__ inline uint32_t mqa_logits_reduce_queries(
     uint32_t num_q_tokens_in_block, uint32_t issued_n,
     uint32_t reversed_pairs
 ) {
-    constexpr bool kPairsQueries = kNumQTokensPerTile >= 2;
     uint32_t num_reduced_queries = 1;
     const auto reduce = [&](auto num_elems) __aicore__ {
         constexpr uint32_t kNumElems = decltype(num_elems)::value;
-        if constexpr (kPairsQueries) {
+        if constexpr (kNumQTokensPerTile >= 2) {
             if (q_local + 1 < kNumQTokensPerTile && q_idx + 1 < num_q_tokens_in_block) {
-                vf_mqa_logits_reduce_2q<kPageSize, kNumElems, kNumHeads, kSplitKV>(score, weight, line, q_local, q_idx,
+                vf_mqa_logits_reduce<kPageSize, kNumElems, kNumHeads, kSplitKV, 2>(score, weight, line, q_local, q_idx,
                                                                                    reversed_pairs);
                 num_reduced_queries = 2;
                 return;
             }
         }
-        vf_mqa_logits_reduce<kPageSize, kNumElems, kNumHeads>(score, weight, line, q_local, q_idx, reversed_pairs);
+        vf_mqa_logits_reduce<kPageSize, kNumElems, kNumHeads, kSplitKV, 1>(score, weight, line, q_local, q_idx, reversed_pairs);
     };
-    constexpr uint32_t kNumElemsPerVecReg = get_num_elems_per_vec_reg<bfloat16_t>();
+    constexpr uint32_t kNumElemsPerVecReg = asc_get_vf_len() / sizeof(bfloat16_t);
     switch (issued_n / kNumElemsPerVecReg) {
         case 1: reduce(std::integral_constant<uint32_t, kNumElemsPerVecReg>{}); break;
         case 2: reduce(std::integral_constant<uint32_t, 2 * kNumElemsPerVecReg>{}); break;
@@ -253,6 +210,7 @@ __aicore__ inline void mqa_logits_core_impl(
     static_assert(kHeadDim == 64 || kHeadDim == 128, "Unsupported head dimension");
     using qk_dtype_t = std::conditional_t<kIsFP4, float4_e2m1x2_t, float8_e4m3_t>;
 
+    constexpr uint32_t kNumVecElems = asc_get_vf_len() / sizeof(bfloat16_t);
     constexpr uint32_t MAD_M = kMadM;
     constexpr uint32_t MAD_M_PADDED = aligned(MAD_M, FRAC_MN);
     constexpr uint32_t MAD_N = kSplitKV;
@@ -385,7 +343,7 @@ __aicore__ inline void mqa_logits_core_impl(
             for (uint32_t kv_split_idx = 0; kv_split_idx < num_kv_splits; ++kv_split_idx) {
                 const uint32_t kv_idx = scheduler.get_kv_token_offset(kv_token_base, kv_split_idx);
                 const uint32_t actual_kv = scheduler.get_num_kv_block_tokens(kv_token_base, kv_split_idx);
-                const uint32_t issued_n = mqa_logits_issued_n(actual_kv);
+                const uint32_t issued_n = aligned(actual_kv, kNumVecElems);
                 asc_sync_wait(PIPE_MTE1, PIPE_MTE2, static_cast<event_t>(kKVEventBase + kv_stage_idx));
                 fill_mn_tail_block(l1kv[kv_stage_idx], actual_kv, issued_n);
                 if constexpr (kIsPaged) {
@@ -583,7 +541,7 @@ __aicore__ inline void mqa_logits_core_impl(
                     prefetch_sf_kv(kv_stage_idx);
                 const uint32_t kv_idx = scheduler.get_kv_token_offset(kv_token_base, kv_split_idx);
                 const uint32_t actual_kv = scheduler.get_num_kv_block_tokens(kv_token_base, kv_split_idx);
-                const uint32_t issued_n = mqa_logits_issued_n(actual_kv);
+                const uint32_t issued_n = aligned(actual_kv, kNumVecElems);
                 uint32_t reversed_pairs = 0;
                 if constexpr (kIsPaged) {
                     const uint32_t num_pages = ceil_div(actual_kv, kPageSize);

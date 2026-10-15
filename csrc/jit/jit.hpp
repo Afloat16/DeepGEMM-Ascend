@@ -84,6 +84,7 @@ inline void init_jit(const std::string& version, const std::string& library_root
         auto jit_runtime = std::make_shared<AscendJIT>(config);
         jit_runtime->default_compiler_options.extra_bisheng_flags.emplace_back(
             "--cce-disable-vf-stack-reserved-ubuf");
+        jit_runtime->default_compiler_options.extra_bisheng_flags.emplace_back("-std=c++20");
         if (deep_jit::get_env<bool>("DG_JIT_WITH_LINEINFO"))
             jit_runtime->default_compiler_options.debug_info = true;
         return jit_runtime;

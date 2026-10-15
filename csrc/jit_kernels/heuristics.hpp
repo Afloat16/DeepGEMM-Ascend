@@ -63,7 +63,7 @@ static constexpr HWDesc get_hw_desc() {
         .vector_reg_bytes=256, .fp4_decode_bytes_per_cycle=64,  // 512 decoded bytes per eight vector cycles.
         .ub_bank_bytes=32,
         .l1_bank_bytes=32,
-        .num_pipe_events=8, .num_intra_block_events=16,
+        .num_pipe_events=kNumPipeEvents, .num_intra_block_events=16,
         .num_ai_cores=32,
         .l2_size_bytes=128 * 1024 * 1024,
         .l2_sector_bytes=kL2SectorBytes, .sf_elements_per_pair=64, .fractal_row_bytes=32,
@@ -111,12 +111,14 @@ static std::optional<GemmConfig> make_gemm_candidate(const GemmDesc& d, const Ge
     // Select L0 stages: always 2 stage
     c.num_l0_stages = 2;
 
+    const bool with_bias = dynamic_cast<const BiasEpilogue*>(d.epilogue_class.get()) != nullptr;
+
     // Search MAD_M, MAD_N, MAD_K
     // 1. at least 2 stage in L0C, to overlap mad and store
     // 2. fit l0a and l0b, to overlap load and mad
-    const bool with_output_sf = d.cd_dtype == at::kFloat8_e4m3fn;
+    const bool with_fp8_cast = d.cd_dtype == at::kFloat8_e4m3fn;
     const int align_m = is_mn_major(d.major_a) ? hw.get_mad_alignment_k(dtype.elem_bits) : hw.get_mad_alignment_mn();
-    const int align_n = with_output_sf ? static_cast<int>(MX_SF_DIVISOR) : is_mn_major(d.major_b) ? hw.get_mad_alignment_k(dtype.elem_bits) : hw.get_mad_alignment_mn();
+    const int align_n = with_bias ? hw.vector_reg_bytes / sizeof(float) : with_fp8_cast ? hw.vector_reg_bytes / sizeof(uint16_t) : is_mn_major(d.major_b) ? hw.get_mad_alignment_k(dtype.elem_bits) : hw.get_mad_alignment_mn();
     c.mad_m = c.mad_n = c.mad_k = 0;
     // search mad_m = block_m / split_m, mad_n = block_n / split_n
     for (auto [split_m, split_n]: {std::pair{1, 1}, std::pair{1, 2}, std::pair{2, 1}}) {
@@ -180,14 +182,16 @@ static std::optional<GemmConfig> make_gemm_candidate(const GemmDesc& d, const Ge
         c.sf_k_blocks = std::clamp(sf_k_blocks, static_cast<int>(c.sf_k_blocks), num_sf_k_blocks_fit);
     }
 
-    // Select Epilogue Stages
+    // Match epilogue::Params and operator UB layouts when selecting stages per AIV.
+    const uint32_t num_aivs = dtype.dequant_b ? 1 : 2;
     const uint32_t num_cd_stages = (block_m / c.mad_m) * (block_n / c.mad_n);
-    const uint32_t epilogue_bytes = c.mad_m * c.mad_n * dtype.epilogue_elem_bits / 8 + (with_output_sf ? c.mad_m * c.mad_n / 32 : 0);
+    const uint32_t epilogue_bytes = c.mad_m * c.mad_n * dtype.epilogue_elem_bits / 8 +
+                                    (with_bias ? block_n * c10::elementSize(d.cd_dtype) : 0) + (with_fp8_cast ? c.mad_m * c.mad_n / 32 : 0);
     c.num_epilogue_stages = std::min<uint32_t>(hw.num_intra_block_events, UBSizeBytes / epilogue_bytes);
     const uint32_t num_batches = is_batched(d.gemm_type) || is_k_grouped(d.gemm_type) ? d.num_groups : 1;
     const uint64_t num_blocks = static_cast<uint64_t>(ceil_div(d.m, block_m)) * ceil_div(d.n, block_n) * num_batches;
     c.num_epilogue_stages = std::min<uint64_t>(c.num_epilogue_stages, ceil_div(num_blocks, d.num_cores) * num_cd_stages);
-    if (c.num_epilogue_stages < num_cd_stages) return std::nullopt;
+    if (c.num_epilogue_stages * num_aivs < num_cd_stages) return std::nullopt;
 
     // Select Cache Hints
     // TODO: smarter heuristics for L2 hints
@@ -470,10 +474,23 @@ static auto get_gemm_cost(const GemmDesc& d, const GemmDtype& dtype, const GemmC
 static int64_t get_gemm_output_cost(const GemmDesc& d, const GemmDtype& dtype, const GemmConfig& c) {
     const auto hw = get_hw_desc();
     const int64_t num_waves = ceil_div(int64_t(ceil_div(d.m, c.block_m)) * ceil_div(d.n, c.block_n), d.num_cores);
-    const int64_t bytes = int64_t(std::min(d.m, c.block_m)) * std::min(d.n, c.block_n) * dtype.epilogue_elem_bits / 8;
+    const int64_t num_values = int64_t(std::min(d.m, c.block_m)) * std::min(d.n, c.block_n);
+    const int64_t bytes = num_values * dtype.epilogue_elem_bits / 8;
+    const bool with_bias = dynamic_cast<const BiasEpilogue*>(d.epilogue_class.get()) != nullptr;
+    // AddBias owns one BLOCK_N row per AIV drain; its hooks preserve the existing overlap.
+    const int64_t bias_bytes = with_bias ? (dtype.dequant_b ? 1 : 2) *
+                               std::min(d.n, c.block_n) * c10::elementSize(d.cd_dtype) : 0;
+    const int64_t bias_ns = ceil_div(bias_bytes * hw.num_ai_cores, hw.gm_bw_gbps);
+    const int64_t gm_bytes = num_values * c10::elementSize(d.cd_dtype) * (1 + d.acc)
+                           + (d.cd_dtype == at::kFloat8_e4m3fn ? num_values / 32 : 0);
     const int64_t fix_ns = ceil_div(bytes * 1000, hw.l0c_to_ub_bytes_per_cycle * hw.aic_clock_mhz);
-    const int64_t gm_ns = ceil_div(bytes * (1 + d.acc) * hw.num_ai_cores, hw.gm_bw_gbps);
-    return num_waves * (c.direct_store ? std::max(fix_ns, gm_ns) : fix_ns + gm_ns);
+    const int64_t gm_ns = ceil_div(gm_bytes * hw.num_ai_cores, hw.gm_bw_gbps);
+    const int64_t vector_values = int64_t(align(std::min(d.m, c.block_m), c.mad_m)) * align(std::min(d.n, c.block_n), c.mad_n);
+    // Pure AddBias performs one vector add per FP32 vector; BF16 packing is fused into its store.
+    const int64_t vector_ns = with_bias ? ceil_div(ceil_div(vector_values * sizeof(float), hw.vector_reg_bytes) * 1000, hw.aic_clock_mhz) : 0;
+    if (with_bias && c.num_epilogue_stages >= 2 && num_waves >= 2)
+        return num_waves * std::max(fix_ns, bias_ns + gm_ns + vector_ns);
+    return num_waves * (c.direct_store ? std::max(fix_ns, gm_ns) : std::max(fix_ns, bias_ns) + gm_ns + vector_ns);
 }
 
 static int64_t get_gemm_refinement_cost(const GemmDesc& d, const GemmDtype& dtype, const GemmConfig& c) {
@@ -586,8 +603,8 @@ static GemmConfig select_gemm_config(const GemmDesc& d) {
     const int64_t b_matrix_bytes = int64_t(d.n) * compute_k * b_elem_bits / 8;
     const int block_cap = dtype.elem_bits == 4 || dtype.dequant_b ? 256 : 512;
     const int m_alignment = is_mn_major(d.major_a) ? hw.get_mad_alignment_k(dtype.elem_bits) : hw.get_mad_alignment_mn();
-    const bool with_output_sf = d.cd_dtype == at::kFloat8_e4m3fn;
-    const int n_alignment = with_output_sf ? static_cast<int>(MX_SF_DIVISOR) : is_mn_major(d.major_b) ? hw.get_mad_alignment_k(dtype.elem_bits) : hw.get_mad_alignment_mn();
+    const bool with_fp8_cast = d.cd_dtype == at::kFloat8_e4m3fn;
+    const int n_alignment = with_fp8_cast ? hw.vector_reg_bytes / sizeof(uint16_t) : is_mn_major(d.major_b) ? hw.get_mad_alignment_k(dtype.elem_bits) : hw.get_mad_alignment_mn();
     const int m_limit = align(d.m, m_alignment);
     std::pair<int, int> m_range{m_alignment, std::min(block_cap, m_limit)}, n_range{n_alignment, block_cap};
     if (is_m_grouped(d.gemm_type)) {
@@ -676,9 +693,27 @@ static GemmConfig select_gemm_config(const GemmDesc& d) {
         }
     }
 
+    // Double-buffer output-bound bias tiles without shortening contiguous operand rows.
+    if (dynamic_cast<const BiasEpilogue*>(d.epilogue_class.get()) && config.num_epilogue_stages == 1 &&
+        get_gemm_output_cost(d, dtype, config) > get_gemm_cost(d, dtype, config)) {
+        const auto primary = config;
+        for (auto [block_m, block_n]: {std::pair{primary.block_m - m_alignment, primary.block_n}, std::pair{primary.block_m, primary.block_n - std::max<int>(n_alignment, hw.vector_reg_bytes / sizeof(float))}}) {
+            if (block_m < m_range.first || block_n < n_range.first ||
+                (block_m != primary.block_m && is_mn_major(d.major_a)) ||
+                (block_n != primary.block_n && is_mn_major(d.major_b))) continue;
+            auto candidate = make_gemm_candidate(d, dtype, block_m, block_n, primary.block_k);
+            if (!candidate || candidate->num_epilogue_stages < 2 || candidate->mad_k != primary.mad_k ||
+                candidate->num_l1_stages < primary.num_l1_stages) continue;
+            candidate->l2_ctrl_store_cd = primary.l2_ctrl_store_cd;
+            *candidate = refine_gemm_pipeline(d, dtype, *candidate);
+            if (get_gemm_k_cost(d, dtype, *candidate) < get_gemm_k_cost(d, dtype, config)) config = *candidate;
+        }
+    }
+
     // Prefer native FP4 full MADs without reducing operand or epilogue buffers.
-    const uint64_t full_epilogue_bytes = uint64_t(config.block_m) * config.block_n * (dtype.epilogue_elem_bits / 8) +
-                                         (with_output_sf ? uint64_t(config.block_m) * config.block_n / 32 : 0);
+    const uint64_t full_epilogue_bytes = uint64_t(config.block_m) * config.block_n * dtype.epilogue_elem_bits / 8 +
+                                         (dynamic_cast<const BiasEpilogue*>(d.epilogue_class.get()) ? config.block_n * c10::elementSize(d.cd_dtype) : 0) +
+                                         (with_fp8_cast ? uint64_t(config.block_m) * config.block_n / 32 : 0);
     if (dtype.elem_bits == 4 && uint64_t(config.block_m) * config.mad_k * config.num_l0_stages * dtype.elem_bits <= L0ASizeBytes * 8 &&
         uint64_t(config.block_n) * config.mad_k * config.num_l0_stages * dtype.elem_bits <= L0BSizeBytes * 8 &&
         full_epilogue_bytes * config.num_epilogue_stages <= UBSizeBytes) {

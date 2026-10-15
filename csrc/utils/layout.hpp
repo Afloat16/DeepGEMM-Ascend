@@ -47,18 +47,18 @@ static Major get_major_type_ab(const at::Tensor& t) {
 }
 
 static void check_major_type_cd(const at::Tensor& d) {
-    major_check(d);
+    DJ_HOST_ASSERT(d.dim() >= 2);
     DJ_HOST_ASSERT(d.stride(-1) == 1);
 }
 
 static bool gemm_early_return(const int& m, const int& n, const int& k,
                               const torch::Tensor& d, const std::optional<torch::Tensor>& c,
-                              const std::optional<torch::Tensor>& sfd = std::nullopt) {
+                              const std::optional<torch::Tensor>& sfd = std::nullopt, bool with_bias = false) {
     if (m == 0 or n == 0)
         return true;
 
     DJ_HOST_ASSERT(not sfd.has_value() or not c.has_value());
-    const bool is_cd_same = c.has_value() and c->data_ptr() == d.data_ptr();
+    const bool is_cd_same = c.has_value() and not d.is_meta() and c->data_ptr() == d.data_ptr();
     if (is_cd_same)
         DJ_HOST_ASSERT(c->sizes() == d.sizes() and c->strides() == d.strides());
 
@@ -79,8 +79,8 @@ static bool gemm_early_return(const int& m, const int& n, const int& k,
         return true;
     }
 
-    // With accumulation, do copy before GEMM (assuming the GEMM kernel does not support different C/D)
-    if (c.has_value() and not is_cd_same)
+    // Legacy accumulation paths initialize D before launch.
+    if (c.has_value() and not is_cd_same and not with_bias)
         d.copy_(c.value());
     return false;
 }
